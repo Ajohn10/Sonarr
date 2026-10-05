@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 using NLog;
 using NzbDrone.Common.Cache;
@@ -28,6 +29,7 @@ namespace NzbDrone.Common.Http
             where T : new();
 
         Task<HttpResponse> ExecuteAsync(HttpRequest request);
+        Task<HttpResponse> ExecuteAsync(HttpRequest request, CancellationToken cancellationToken);
         Task DownloadFileAsync(string url, string fileName);
         Task<HttpResponse> GetAsync(HttpRequest request);
         Task<HttpResponse<T>> GetAsync<T>(HttpRequest request)
@@ -63,11 +65,16 @@ namespace NzbDrone.Common.Http
             _cookieContainerCache = cacheManager.GetCache<CookieContainer>(typeof(HttpClient));
         }
 
-        public virtual async Task<HttpResponse> ExecuteAsync(HttpRequest request)
+        public virtual Task<HttpResponse> ExecuteAsync(HttpRequest request)
+        {
+            return ExecuteAsync(request, CancellationToken.None);
+        }
+
+        public virtual async Task<HttpResponse> ExecuteAsync(HttpRequest request, CancellationToken cancellationToken)
         {
             var cookieContainer = InitializeRequestCookies(request);
 
-            var response = await ExecuteRequestAsync(request, cookieContainer);
+            var response = await ExecuteRequestAsync(request, cookieContainer, cancellationToken);
 
             if (request.AllowAutoRedirect && response.HasHttpRedirect)
             {
@@ -93,7 +100,7 @@ namespace NzbDrone.Common.Http
                         request.ContentSummary = null;
                     }
 
-                    response = await ExecuteRequestAsync(request, cookieContainer);
+                    response = await ExecuteRequestAsync(request, cookieContainer, cancellationToken);
                 }
                 while (response.HasHttpRedirect);
             }
@@ -138,7 +145,7 @@ namespace NzbDrone.Common.Http
             };
         }
 
-        private async Task<HttpResponse> ExecuteRequestAsync(HttpRequest request, CookieContainer cookieContainer)
+        private async Task<HttpResponse> ExecuteRequestAsync(HttpRequest request, CookieContainer cookieContainer, CancellationToken cancellationToken)
         {
             foreach (var interceptor in _requestInterceptors)
             {
@@ -154,7 +161,7 @@ namespace NzbDrone.Common.Http
 
             var stopWatch = Stopwatch.StartNew();
 
-            var response = await _httpDispatcher.GetResponseAsync(request, cookieContainer);
+            var response = await _httpDispatcher.GetResponseAsync(request, cookieContainer, cancellationToken);
 
             HandleResponseCookies(response, cookieContainer);
 

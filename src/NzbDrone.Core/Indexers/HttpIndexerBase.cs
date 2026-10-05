@@ -11,6 +11,7 @@ using NzbDrone.Common.Http;
 using NzbDrone.Core.Configuration;
 using NzbDrone.Core.Http.CloudFlare;
 using NzbDrone.Core.Indexers.Exceptions;
+using NzbDrone.Core.IndexerSearch;
 using NzbDrone.Core.IndexerSearch.Definitions;
 using NzbDrone.Core.Localization;
 using NzbDrone.Core.Parser;
@@ -30,6 +31,9 @@ namespace NzbDrone.Core.Indexers
         public bool SupportsPaging => PageSize > 0;
 
         public virtual int PageSize => 0;
+
+        // Whether the indexer may answer progressive searches with application/x-ndjson
+        public virtual bool SupportsNdjsonStreaming => false;
         public virtual TimeSpan RateLimit => TimeSpan.FromSeconds(2);
 
         public abstract IIndexerRequestGenerator GetRequestGenerator();
@@ -131,6 +135,7 @@ namespace NzbDrone.Core.Indexers
             var releases = new List<ReleaseInfo>();
             var url = string.Empty;
             var minimumBackoff = TimeSpan.FromHours(1);
+            var scope = ReleaseSearchScope.Current;
 
             try
             {
@@ -161,6 +166,12 @@ namespace NzbDrone.Core.Indexers
                             var page = await FetchPage(request, parser);
 
                             pagedReleases.AddRange(page);
+
+                            if (!isRecent && scope != null)
+                            {
+                                // Let a progressive search show this page before the remaining pages are fetched
+                                await scope.PublishAsync(CleanupReleases(page.Where(IsValidRelease)));
+                            }
 
                             if (isRecent && page.Any())
                             {
@@ -220,6 +231,11 @@ namespace NzbDrone.Core.Indexers
                 }
 
                 _indexerStatusService.RecordSuccess(Definition.Id);
+            }
+            catch (Exception ex) when (IsCancelledOrReported(scope, ex))
+            {
+                // Search was cancelled by the caller, not an indexer failure
+                throw;
             }
             catch (WebException webException)
             {
@@ -306,6 +322,25 @@ namespace NzbDrone.Core.Indexers
             return CleanupReleases(releases);
         }
 
+        // Exception filter: returns true (rethrow) when the search was cancelled, otherwise records the
+        // failure for the progressive search and returns false so the regular handlers run.
+        private static bool IsCancelledOrReported(IndexerSearchScope scope, Exception ex)
+        {
+            if (scope == null)
+            {
+                return false;
+            }
+
+            if (scope.Token.IsCancellationRequested)
+            {
+                return true;
+            }
+
+            scope.ReportError(ex.Message);
+
+            return false;
+        }
+
         protected virtual bool IsValidRelease(ReleaseInfo release)
         {
             if (release.Title.IsNullOrWhiteSpace())
@@ -332,7 +367,43 @@ namespace NzbDrone.Core.Indexers
 
         protected virtual async Task<IList<ReleaseInfo>> FetchPage(IndexerRequest request, IParseIndexerResponse parser)
         {
+            var scope = ReleaseSearchScope.Current;
+            NdjsonReleaseStream ndjson = null;
+
+            if (scope != null && SupportsNdjsonStreaming)
+            {
+                // Opt in to progressive results, indexers that don't support it keep answering with XML
+                request.HttpRequest.Headers.Accept = $"{NdjsonReleaseStream.MediaType}, {request.HttpRequest.Headers.Accept}".TrimEnd(' ', ',');
+                request.HttpRequest.ResponseStreamFactory = headers =>
+                {
+                    if (headers.ContentType.IsNotNullOrWhiteSpace() && headers.ContentType.Contains(NdjsonReleaseStream.MediaType, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ndjson = new NdjsonReleaseStream(Protocol, PublishStreamedReleases(scope));
+                        return ndjson;
+                    }
+
+                    return null;
+                };
+            }
+
             var response = await FetchIndexerResponse(request);
+
+            if (ndjson != null)
+            {
+                await ndjson.CompleteAsync();
+
+                if (ndjson.Error != null)
+                {
+                    throw new IndexerException(response, ndjson.Error);
+                }
+
+                if (!ndjson.Completed)
+                {
+                    throw new IndexerException(response, "Indexer stream ended without a terminal record, results may be incomplete");
+                }
+
+                return ndjson.Releases;
+            }
 
             try
             {
@@ -346,6 +417,11 @@ namespace NzbDrone.Core.Indexers
             }
         }
 
+        private Func<IList<ReleaseInfo>, Task> PublishStreamedReleases(IndexerSearchScope scope)
+        {
+            return batch => scope.PublishAsync(CleanupReleases(batch.Where(IsValidRelease)));
+        }
+
         protected virtual async Task<IndexerResponse> FetchIndexerResponse(IndexerRequest request)
         {
             _logger.Debug("Downloading Feed " + request.HttpRequest.ToString(false));
@@ -357,7 +433,11 @@ namespace NzbDrone.Core.Indexers
 
             request.HttpRequest.RateLimitKey = Definition.Id.ToString();
 
-            var response = await _httpClient.ExecuteAsync(request.HttpRequest);
+            var token = ReleaseSearchScope.Current?.Token ?? default;
+
+            var response = token.CanBeCanceled
+                ? await _httpClient.ExecuteAsync(request.HttpRequest, token)
+                : await _httpClient.ExecuteAsync(request.HttpRequest);
 
             return new IndexerResponse(request, response);
         }

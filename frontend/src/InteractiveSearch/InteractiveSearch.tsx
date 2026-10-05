@@ -124,6 +124,7 @@ function InteractiveSearch({ type, searchPayload }: InteractiveSearchProps) {
     isPopulated,
     error,
     items,
+    indexerErrors,
     totalItems,
     selectedFilterKey,
     filters,
@@ -190,6 +191,15 @@ function InteractiveSearch({ type, searchPayload }: InteractiveSearchProps) {
       </div>
 
       {isFetching ? <LoadingIndicator /> : null}
+
+      {indexerErrors?.length ? (
+        <Alert kind={kinds.WARNING}>
+          {translate('InteractiveSearchIndexerErrors', {
+            count: indexerErrors.length,
+            errors: indexerErrors.join('; '),
+          })}
+        </Alert>
+      ) : null}
 
       {!isFetching && error ? (
         <div>

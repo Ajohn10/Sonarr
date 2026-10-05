@@ -45,6 +45,7 @@ interface Release {
   downloadAllowed: boolean;
   isDaily: boolean;
 
+  releaseWeight: number;
   isGrabbing?: boolean;
   isGrabbed?: boolean;
   grabError?: string;

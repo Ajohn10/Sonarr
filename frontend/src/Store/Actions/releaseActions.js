@@ -1,10 +1,12 @@
 import { createAction } from 'redux-actions';
 import { filterBuilderTypes, filterBuilderValueTypes, filterTypePredicates, filterTypes, sortDirections } from 'Helpers/Props';
+import { applyReleaseOrder, upsertReleases as upsertReleaseItems } from 'InteractiveSearch/releaseStreamState';
+import streamReleases from 'InteractiveSearch/streamReleases';
 import { createThunk, handleThunks } from 'Store/thunks';
 import sortByProp from 'Utilities/Array/sortByProp';
 import createAjaxRequest from 'Utilities/createAjaxRequest';
 import translate from 'Utilities/String/translate';
-import createFetchHandler from './Creators/createFetchHandler';
+import { set } from './baseActions';
 import createHandleActions from './Creators/createHandleActions';
 import createSetClientSideCollectionFilterReducer from './Creators/Reducers/createSetClientSideCollectionFilterReducer';
 import createSetClientSideCollectionSortReducer from './Creators/Reducers/createSetClientSideCollectionSortReducer';
@@ -17,6 +19,7 @@ export const episodeSection = 'releases.episode';
 export const seasonSection = 'releases.season';
 
 let abortCurrentRequest = null;
+let fetchId = 0;
 
 //
 // State
@@ -26,6 +29,7 @@ export const defaultState = {
   isPopulated: false,
   error: null,
   items: [],
+  indexerErrors: [],
   sortKey: 'releaseWeight',
   sortDirection: sortDirections.ASCENDING,
   sortPredicates: {
@@ -282,6 +286,9 @@ export const FETCH_RELEASES = 'releases/fetchReleases';
 export const CANCEL_FETCH_RELEASES = 'releases/cancelFetchReleases';
 export const SET_RELEASES_SORT = 'releases/setReleasesSort';
 export const CLEAR_RELEASES = 'releases/clearReleases';
+export const UPSERT_RELEASES = 'releases/upsertReleases';
+export const COMPLETE_RELEASES = 'releases/completeReleases';
+export const ADD_RELEASE_INDEXER_ERROR = 'releases/addReleaseIndexerError';
 export const GRAB_RELEASE = 'releases/grabRelease';
 export const UPDATE_RELEASE = 'releases/updateRelease';
 export const SET_EPISODE_RELEASES_FILTER = 'releases/setEpisodeReleasesFilter';
@@ -294,6 +301,9 @@ export const fetchReleases = createThunk(FETCH_RELEASES);
 export const cancelFetchReleases = createThunk(CANCEL_FETCH_RELEASES);
 export const setReleasesSort = createAction(SET_RELEASES_SORT);
 export const clearReleases = createAction(CLEAR_RELEASES);
+export const upsertReleases = createAction(UPSERT_RELEASES);
+export const completeReleases = createAction(COMPLETE_RELEASES);
+export const addReleaseIndexerError = createAction(ADD_RELEASE_INDEXER_ERROR);
 export const grabRelease = createThunk(GRAB_RELEASE);
 export const updateRelease = createAction(UPDATE_RELEASE);
 export const setEpisodeReleasesFilter = createAction(SET_EPISODE_RELEASES_FILTER);
@@ -302,7 +312,64 @@ export const setSeasonReleasesFilter = createAction(SET_SEASON_RELEASES_FILTER);
 //
 // Helpers
 
-const fetchReleasesHelper = createFetchHandler(section, '/release');
+// Streams the search so releases show up (and can be grabbed) while indexers are still responding
+function fetchReleasesHelper(getState, payload, dispatch) {
+  const id = ++fetchId;
+  const controller = new AbortController();
+  const params = new URLSearchParams();
+
+  Object.keys(payload).forEach((key) => {
+    if (payload[key] != null) {
+      params.append(key, payload[key]);
+    }
+  });
+
+  dispatch(set({
+    section,
+    isFetching: true,
+    isPopulated: false,
+    error: null,
+    items: [],
+    indexerErrors: []
+  }));
+
+  const isCurrent = () => id === fetchId && !controller.signal.aborted;
+
+  streamReleases({
+    url: `${window.Sonarr.apiRoot}/release/stream?${params.toString()}`,
+    apiKey: window.Sonarr.apiKey,
+    signal: controller.signal,
+    onReleases: (releases) => {
+      if (isCurrent()) {
+        dispatch(upsertReleases({ releases }));
+      }
+    },
+    onIndexerError: (message) => {
+      if (isCurrent()) {
+        dispatch(addReleaseIndexerError({ message }));
+      }
+    },
+    onComplete: (order) => {
+      if (isCurrent()) {
+        dispatch(completeReleases({ order }));
+      }
+    }
+  }).catch((error) => {
+    if (isCurrent()) {
+      dispatch(set({
+        section,
+        isFetching: false,
+        error: {
+          status: error.status ?? 500,
+          statusText: error.message,
+          responseJSON: { message: error.message }
+        }
+      }));
+    }
+  });
+
+  return () => controller.abort();
+}
 
 //
 // Action Handlers
@@ -317,7 +384,10 @@ export const actionHandlers = handleThunks({
 
   [CANCEL_FETCH_RELEASES]: function(getState, payload, dispatch) {
     if (abortCurrentRequest) {
-      abortCurrentRequest = abortCurrentRequest();
+      abortCurrentRequest();
+      abortCurrentRequest = null;
+      fetchId++;
+      dispatch(set({ section, isFetching: false }));
     }
   },
 
@@ -369,6 +439,22 @@ export const reducers = createHandleActions({
     } = defaultState;
 
     return Object.assign({}, state, otherDefaultState);
+  },
+
+  [UPSERT_RELEASES]: (state, { payload }) => {
+    const items = upsertReleaseItems(state.items, payload.releases);
+
+    return Object.assign({}, state, { items, isPopulated: true });
+  },
+
+  [COMPLETE_RELEASES]: (state, { payload }) => {
+    const items = applyReleaseOrder(state.items, payload.order);
+
+    return Object.assign({}, state, { items, isFetching: false, isPopulated: true, error: null });
+  },
+
+  [ADD_RELEASE_INDEXER_ERROR]: (state, { payload }) => {
+    return Object.assign({}, state, { indexerErrors: [...state.indexerErrors, payload.message] });
   },
 
   [UPDATE_RELEASE]: (state, { payload }) => {

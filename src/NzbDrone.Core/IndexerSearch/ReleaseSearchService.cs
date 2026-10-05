@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using NLog;
 using NzbDrone.Common.Extensions;
@@ -23,6 +24,8 @@ namespace NzbDrone.Core.IndexerSearch
         Task<List<DownloadDecision>> EpisodeSearch(Episode episode, bool userInvokedSearch, bool interactiveSearch);
         Task<List<DownloadDecision>> SeasonSearch(int seriesId, int seasonNumber, bool missingOnly, bool monitoredOnly, bool userInvokedSearch, bool interactiveSearch);
         Task<List<DownloadDecision>> SeasonSearch(int seriesId, int seasonNumber, List<Episode> episodes, bool monitoredOnly, bool userInvokedSearch, bool interactiveSearch);
+        Task<List<DownloadDecision>> EpisodeSearch(int episodeId, bool userInvokedSearch, bool interactiveSearch, IReleaseSearchSink sink, CancellationToken cancellationToken);
+        Task<List<DownloadDecision>> SeasonSearch(int seriesId, int seasonNumber, bool missingOnly, bool monitoredOnly, bool userInvokedSearch, bool interactiveSearch, IReleaseSearchSink sink, CancellationToken cancellationToken);
     }
 
     public class ReleaseSearchService : ISearchForReleases
@@ -33,6 +36,9 @@ namespace NzbDrone.Core.IndexerSearch
         private readonly IEpisodeService _episodeService;
         private readonly IMakeDownloadDecision _makeDownloadDecision;
         private readonly Logger _logger;
+
+        private static readonly AsyncLocal<ReleaseSearchStream> CurrentStream = new AsyncLocal<ReleaseSearchStream>();
+        private const int StreamBatchSize = 100;
 
         public ReleaseSearchService(IIndexerFactory indexerFactory,
                                 ISceneMappingService sceneMapping,
@@ -47,6 +53,32 @@ namespace NzbDrone.Core.IndexerSearch
             _episodeService = episodeService;
             _makeDownloadDecision = makeDownloadDecision;
             _logger = logger;
+        }
+
+        public Task<List<DownloadDecision>> EpisodeSearch(int episodeId, bool userInvokedSearch, bool interactiveSearch, IReleaseSearchSink sink, CancellationToken cancellationToken)
+        {
+            return RunStreaming(sink, cancellationToken, () => EpisodeSearch(episodeId, userInvokedSearch, interactiveSearch));
+        }
+
+        public Task<List<DownloadDecision>> SeasonSearch(int seriesId, int seasonNumber, bool missingOnly, bool monitoredOnly, bool userInvokedSearch, bool interactiveSearch, IReleaseSearchSink sink, CancellationToken cancellationToken)
+        {
+            return RunStreaming(sink, cancellationToken, () => SeasonSearch(seriesId, seasonNumber, missingOnly, monitoredOnly, userInvokedSearch, interactiveSearch));
+        }
+
+        private async Task<List<DownloadDecision>> RunStreaming(IReleaseSearchSink sink, CancellationToken cancellationToken, Func<Task<List<DownloadDecision>>> search)
+        {
+            using var stream = new ReleaseSearchStream(sink, cancellationToken);
+
+            CurrentStream.Value = stream;
+
+            try
+            {
+                return await search();
+            }
+            finally
+            {
+                CurrentStream.Value = null;
+            }
         }
 
         public async Task<List<DownloadDecision>> EpisodeSearch(int episodeId, bool userInvokedSearch, bool interactiveSearch)
@@ -522,13 +554,30 @@ namespace NzbDrone.Core.IndexerSearch
 
             _logger.ProgressInfo("Searching indexers for {0}. {1} active indexers", criteriaBase, indexers.Count);
 
-            var tasks = indexers.Select(indexer => DispatchIndexer(searchAction, indexer, criteriaBase));
+            var stream = CurrentStream.Value;
+            List<DownloadDecision> streamedDecisions = null;
+            List<ReleaseInfo> reports = null;
 
-            var batch = await Task.WhenAll(tasks);
+            if (stream != null)
+            {
+                streamedDecisions = new List<DownloadDecision>();
 
-            var reports = batch.SelectMany(x => x).ToList();
+                await Task.WhenAll(indexers.Select(indexer => DispatchIndexerStreaming(searchAction, indexer, criteriaBase, stream, streamedDecisions)));
 
-            _logger.ProgressDebug("Total of {0} reports were found for {1} from {2} indexers", reports.Count, criteriaBase, indexers.Count);
+                stream.Token.ThrowIfCancellationRequested();
+
+                _logger.ProgressDebug("Total of {0} decisions were made for {1} from {2} indexers", streamedDecisions.Count, criteriaBase, indexers.Count);
+            }
+            else
+            {
+                var tasks = indexers.Select(indexer => DispatchIndexer(searchAction, indexer, criteriaBase));
+
+                var batch = await Task.WhenAll(tasks);
+
+                reports = batch.SelectMany(x => x).ToList();
+
+                _logger.ProgressDebug("Total of {0} reports were found for {1} from {2} indexers", reports.Count, criteriaBase, indexers.Count);
+            }
 
             // Update the last search time for all episodes if at least 1 indexer was searched.
             if (indexers.Any())
@@ -540,7 +589,80 @@ namespace NzbDrone.Core.IndexerSearch
                 _episodeService.UpdateLastSearchTime(criteriaBase.Episodes);
             }
 
-            return _makeDownloadDecision.GetSearchDecision(reports, criteriaBase).ToList();
+            return streamedDecisions ?? _makeDownloadDecision.GetSearchDecision(reports, criteriaBase).ToList();
+        }
+
+        private async Task DispatchIndexerStreaming(Func<IIndexer, Task<IList<ReleaseInfo>>> searchAction, IIndexer indexer, SearchCriteriaBase criteriaBase, ReleaseSearchStream stream, List<DownloadDecision> decisions)
+        {
+            var scope = new IndexerSearchScope(stream.Token, releases => ProcessBatch(releases, criteriaBase, stream, decisions));
+
+            try
+            {
+                IList<ReleaseInfo> reports;
+
+                using (ReleaseSearchScope.Use(scope))
+                {
+                    reports = await searchAction(indexer);
+                }
+
+                // Indexers that can't publish partial results return everything at once
+                await scope.PublishAsync(reports);
+            }
+            catch (Exception) when (stream.Token.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Error while searching for {0}", criteriaBase);
+                scope.ReportError(ex.Message);
+            }
+
+            foreach (var error in scope.Errors)
+            {
+                await EmitToSink(stream, () => stream.Sink.OnIndexerError(indexer.Definition.Id, indexer.Definition.Name, error));
+            }
+        }
+
+        private async Task ProcessBatch(IList<ReleaseInfo> releases, SearchCriteriaBase criteriaBase, ReleaseSearchStream stream, List<DownloadDecision> decisions)
+        {
+            foreach (var chunk in releases.Chunk(StreamBatchSize))
+            {
+                await EmitToSink(stream, () =>
+                {
+                    var chunkDecisions = _makeDownloadDecision.GetSearchDecision(chunk.ToList(), criteriaBase);
+
+                    decisions.AddRange(chunkDecisions);
+
+                    var upserts = stream.Upsert(chunkDecisions);
+
+                    return upserts.Count > 0 ? stream.Sink.OnDecisions(upserts) : Task.CompletedTask;
+                });
+            }
+        }
+
+        private async Task EmitToSink(ReleaseSearchStream stream, Func<Task> action)
+        {
+            await stream.Gate.WaitAsync(stream.Token);
+
+            try
+            {
+                stream.Token.ThrowIfCancellationRequested();
+
+                await action();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException && !stream.Token.IsCancellationRequested)
+            {
+                // A failing consumer (e.g. a closed connection) ends the whole search
+                _logger.Debug(ex, "Release search consumer failed, aborting search");
+                stream.Abort();
+
+                throw new OperationCanceledException(stream.Token);
+            }
+            finally
+            {
+                stream.Gate.Release();
+            }
         }
 
         private async Task<IList<ReleaseInfo>> DispatchIndexer(Func<IIndexer, Task<IList<ReleaseInfo>>> searchAction, IIndexer indexer, SearchCriteriaBase criteriaBase)

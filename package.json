@@ -10,7 +10,8 @@
     "watch": "webpack --watch --config ./frontend/build/webpack.config.js",
     "lint": "eslint --config frontend/.eslintrc.js --ignore-path frontend/.eslintignore frontend/",
     "lint-fix": "yarn lint --fix",
-    "stylelint": "stylelint \"frontend/**/*.css\" --config frontend/.stylelintrc"
+    "stylelint": "stylelint \"frontend/**/*.css\" --config frontend/.stylelintrc",
+    "test": "vitest run"
   },
   "repository": "https://github.com/Sonarr/Sonarr",
   "author": "Team Sonarr",
@@ -142,6 +143,7 @@
     "ts-loader": "9.5.1",
     "typescript-plugin-css-modules": "5.0.1",
     "url-loader": "4.1.1",
+    "vitest": "3.2.4",
     "webpack": "5.95.0",
     "webpack-cli": "5.1.4",
     "webpack-livereload-plugin": "3.0.2",
