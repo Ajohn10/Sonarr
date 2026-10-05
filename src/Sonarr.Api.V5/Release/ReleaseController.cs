@@ -1,3 +1,4 @@
+using System.Text.Json;
 using FluentValidation;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
@@ -6,6 +7,7 @@ using NLog;
 using NzbDrone.Common.Cache;
 using NzbDrone.Common.EnsureThat;
 using NzbDrone.Common.Extensions;
+using NzbDrone.Common.Serializer;
 using NzbDrone.Core.DecisionEngine;
 using NzbDrone.Core.Download;
 using NzbDrone.Core.Exceptions;
@@ -207,6 +209,160 @@ public class ReleaseController : RestController<ReleaseResource>
         }
 
         return TypedResults.Ok(await GetRss());
+    }
+
+    /// <summary>
+    /// Progressive variant of GET /release. Streams application/x-ndjson frames:
+    /// {"type":"releases","batch":n,"releases":[ReleaseResource]} (upserts keyed by release.guid),
+    /// {"type":"indexerError","indexerId":n,"indexer":"name","message":"..."},
+    /// {"type":"complete","order":[guid...],"total":n,"indexerErrors":n} (final ordering) and
+    /// {"type":"error","message":"..."} (fatal, after the response has started).
+    /// </summary>
+    [HttpGet("stream")]
+    [Produces("application/x-ndjson")]
+    public async Task StreamReleases(int? seriesId, int? episodeId, int? seasonNumber, CancellationToken cancellationToken)
+    {
+        if (!episodeId.HasValue && !(seriesId.HasValue && seasonNumber.HasValue))
+        {
+            throw new NzbDroneClientException(HttpStatusCode.BadRequest, "episodeId or seriesId and seasonNumber must be provided");
+        }
+
+        var history = episodeId.HasValue
+            ? _historyService.FindByEpisodeId(episodeId.Value)
+            : _historyService.GetBySeason(seriesId!.Value, seasonNumber!.Value, null);
+
+        Response.StatusCode = StatusCodes.Status200OK;
+        Response.ContentType = "application/x-ndjson";
+        Response.Headers.CacheControl = "no-store";
+        Response.Headers["X-Accel-Buffering"] = "no";
+
+        var sink = new ReleaseStreamSink(this, history, Response.Body, cancellationToken);
+
+        try
+        {
+            var decisions = episodeId.HasValue
+                ? await _releaseSearchService.EpisodeSearch(episodeId.Value, true, true, sink, cancellationToken)
+                : await _releaseSearchService.SeasonSearch(seriesId!.Value, seasonNumber!.Value, false, false, true, true, sink, cancellationToken);
+
+            var prioritized = _prioritizeDownloadDecision.PrioritizeDecisions(decisions);
+
+            await sink.CompleteAsync(prioritized);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _logger.Debug("Interactive search stream cancelled by the client");
+        }
+        catch (Exception ex)
+        {
+            if (ex is not SearchFailedException)
+            {
+                _logger.Error(ex, "Streaming search failed: " + ex.Message);
+            }
+
+            await sink.FailAsync(ex.Message);
+        }
+    }
+
+    private class ReleaseStreamSink : IReleaseSearchSink
+    {
+        private readonly ReleaseController _controller;
+        private readonly List<EpisodeHistory> _history;
+        private readonly Stream _output;
+        private readonly CancellationToken _cancellationToken;
+        private readonly JsonSerializerOptions _options;
+        private readonly HashSet<string> _sent = new ();
+        private readonly SemaphoreSlim _writeLock = new (1, 1);
+        private int _batch;
+        private int _indexerErrors;
+
+        public ReleaseStreamSink(ReleaseController controller, List<EpisodeHistory> history, Stream output, CancellationToken cancellationToken)
+        {
+            _controller = controller;
+            _history = history;
+            _output = output;
+            _cancellationToken = cancellationToken;
+            _options = STJson.GetSerializerSettings();
+        }
+
+        public Task OnDecisions(IReadOnlyList<DownloadDecision> decisions)
+        {
+            return WriteDecisionsAsync(decisions);
+        }
+
+        public Task OnIndexerError(int indexerId, string indexerName, string message)
+        {
+            Interlocked.Increment(ref _indexerErrors);
+
+            return WriteAsync(new { type = "indexerError", indexerId, indexer = indexerName, message });
+        }
+
+        public async Task CompleteAsync(List<DownloadDecision> prioritized)
+        {
+            // The final winners were normally streamed already; send any that were not, then the final ordering
+            var missing = prioritized.Where(d => !_sent.Contains(d.RemoteEpisode.Release.Guid ?? string.Empty)).ToList();
+
+            if (missing.Count > 0)
+            {
+                await WriteDecisionsAsync(missing);
+            }
+
+            foreach (var decision in prioritized)
+            {
+                // Refresh the cache so the final winner of each guid is the one that can be grabbed
+                var release = decision.RemoteEpisode.Release;
+
+                _controller._remoteEpisodeCache.Set(string.Concat(release.IndexerId, "_", release.Guid), decision.RemoteEpisode, TimeSpan.FromMinutes(30));
+            }
+
+            await WriteAsync(new
+            {
+                type = "complete",
+                order = prioritized.Select(d => d.RemoteEpisode.Release.Guid ?? string.Empty).ToList(),
+                total = prioritized.Count,
+                indexerErrors = _indexerErrors
+            });
+        }
+
+        public Task FailAsync(string message)
+        {
+            return WriteAsync(new { type = "error", message });
+        }
+
+        private Task WriteDecisionsAsync(IReadOnlyList<DownloadDecision> decisions)
+        {
+            var resources = new List<ReleaseResource>(decisions.Count);
+
+            foreach (var decision in decisions)
+            {
+                var resource = decision.MapDecision(0, _controller._qualityProfile);
+
+                resource.History = _controller.AddHistory(decision.RemoteEpisode.Release, _history);
+                _controller._remoteEpisodeCache.Set(_controller.GetCacheKey(resource), decision.RemoteEpisode, TimeSpan.FromMinutes(30));
+                _sent.Add(decision.RemoteEpisode.Release.Guid ?? string.Empty);
+
+                resources.Add(resource);
+            }
+
+            return WriteAsync(new { type = "releases", batch = Interlocked.Increment(ref _batch), releases = resources });
+        }
+
+        private async Task WriteAsync(object frame)
+        {
+            await _writeLock.WaitAsync(_cancellationToken);
+
+            try
+            {
+                await STJson.SerializeAsync(frame, _output, _options);
+                await _output.WriteAsync(NewLine, _cancellationToken);
+                await _output.FlushAsync(_cancellationToken);
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
+
+        private static readonly byte[] NewLine = [(byte)'\n'];
     }
 
     private async Task<List<ReleaseResource>> GetEpisodeReleases(int episodeId)

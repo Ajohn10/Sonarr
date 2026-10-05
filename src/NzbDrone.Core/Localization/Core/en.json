@@ -1191,6 +1191,7 @@
   "InteractiveImportNoSeries": "Series must be chosen for each selected file",
   "InteractiveSearch": "Interactive Search",
   "InteractiveSearchGrabError": "Failed to add to download queue",
+  "InteractiveSearchIndexerErrors": "{count} indexer(s) returned errors, results may be incomplete: {errors}",
   "InteractiveSearchModalHeader": "Interactive Search",
   "InteractiveSearchModalHeaderSeason": "Interactive Search - {season}",
   "InteractiveSearchResultsSeriesFailedErrorMessage": "Search failed because its {message}. Try refreshing the series info and verify the necessary information is present before searching again.",

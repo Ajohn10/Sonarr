@@ -106,13 +106,23 @@ namespace NzbDrone.Common.Http.Dispatchers
             {
                 using var responseMessage = await httpClient.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, cts.Token);
 
+                var headers = responseMessage.Headers.ToNameValueCollection();
+
+                headers.Add(responseMessage.Content.Headers.ToNameValueCollection());
+
+                var httpHeader = new HttpHeader(headers);
+
                 byte[] data = null;
 
                 try
                 {
-                    if (request.ResponseStream != null && responseMessage.StatusCode == HttpStatusCode.OK)
+                    var responseStream = responseMessage.StatusCode == HttpStatusCode.OK
+                        ? request.ResponseStream ?? request.ResponseStreamFactory?.Invoke(httpHeader)
+                        : null;
+
+                    if (responseStream != null)
                     {
-                        await responseMessage.Content.CopyToAsync(request.ResponseStream, null, cts.Token);
+                        await responseMessage.Content.CopyToAsync(responseStream, null, cts.Token);
                     }
                     else
                     {
@@ -124,11 +134,7 @@ namespace NzbDrone.Common.Http.Dispatchers
                     throw new WebException("Failed to read complete http response", ex, WebExceptionStatus.ReceiveFailure, null);
                 }
 
-                var headers = responseMessage.Headers.ToNameValueCollection();
-
-                headers.Add(responseMessage.Content.Headers.ToNameValueCollection());
-
-                return new HttpResponse(request, new HttpHeader(headers), data, responseMessage.StatusCode, responseMessage.Version);
+                return new HttpResponse(request, httpHeader, data, responseMessage.StatusCode, responseMessage.Version);
             }
             catch (OperationCanceledException ex) when (cts.IsCancellationRequested)
             {

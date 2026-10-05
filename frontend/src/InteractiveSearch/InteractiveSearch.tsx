@@ -79,6 +79,7 @@ function InteractiveSearch({
     isFetching,
     isFetched,
     error,
+    indexerErrors,
     data,
     totalItems,
     selectedFilterKey,
@@ -235,7 +236,16 @@ function InteractiveSearch({
         </Alert>
       ) : null}
 
-      {!isFetching && !!data.length ? (
+      {indexerErrors.length ? (
+        <Alert kind={kinds.WARNING}>
+          {translate('InteractiveSearchIndexerErrors', {
+            count: indexerErrors.length,
+            errors: indexerErrors.join('; '),
+          })}
+        </Alert>
+      ) : null}
+
+      {data.length ? (
         <div ref={measureRef}>
           <InteractiveSearchTableHeader
             columns={columns}

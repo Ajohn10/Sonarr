@@ -1,4 +1,4 @@
-import { hashKey, useQueryClient } from '@tanstack/react-query';
+import { hashKey, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useMemo, useState } from 'react';
 import { create } from 'zustand';
 import ModelBase from 'App/ModelBase';
@@ -7,7 +7,6 @@ import type DownloadProtocol from 'DownloadClient/DownloadProtocol';
 import { Filter, FilterBuilderProp } from 'Filters/Filter';
 import { useCustomFiltersList } from 'Filters/useCustomFilters';
 import useApiMutation from 'Helpers/Hooks/useApiMutation';
-import useApiQuery from 'Helpers/Hooks/useApiQuery';
 import { applySort } from 'Helpers/Hooks/useOptionsStore';
 import { filterBuilderTypes, filterBuilderValueTypes } from 'Helpers/Props';
 import { FilterType } from 'Helpers/Props/filterTypes';
@@ -19,6 +18,9 @@ import { AlternateTitle } from 'Series/Series';
 import { CustomFormat } from 'Settings/CustomFormats/CustomFormats/useCustomFormats';
 import Rejection from 'typings/Rejection';
 import sortByProp from 'Utilities/Array/sortByProp';
+import { ApiError } from 'Utilities/Fetch/fetchJson';
+import getQueryPath from 'Utilities/Fetch/getQueryPath';
+import getQueryString from 'Utilities/Fetch/getQueryString';
 import clientSideFilterAndSort from 'Utilities/Filter/clientSideFilterAndSort';
 import enumToTitle from 'Utilities/String/enumToTitle';
 import translate from 'Utilities/String/translate';
@@ -28,6 +30,7 @@ import {
   setReleaseOption,
   useReleaseOptions,
 } from './releaseOptionsStore';
+import streamReleases from './streamReleases';
 
 export interface ReleaseEpisode {
   id: number;
@@ -375,6 +378,11 @@ const releaseStore = create<ReleaseStore>(() => ({
 
 const DEFAULT_RELEASES: Release[] = [];
 const THIRTY_MINUTES = 30 * 60 * 1000;
+interface ReleaseErrorsStore {
+  errors: Record<string, string[]>;
+}
+
+const releaseErrorsStore = create<ReleaseErrorsStore>(() => ({ errors: {} }));
 
 const useReleases = (payload: InteractiveSearchPayload, filter = '') => {
   const customFilters = useCustomFiltersList('releases');
@@ -386,20 +394,41 @@ const useReleases = (payload: InteractiveSearchPayload, filter = '') => {
   const selectedFilterKey =
     'seriesId' in payload ? seasonSelectedFilterKey : episodeSelectedFilterKey;
 
-  const { data, queryKey, ...result } = useApiQuery<Release[]>({
-    path: '/release',
-    queryParams: {
-      ...payload,
+  const queryClient = useQueryClient();
+  const queryKey = useMemo(() => ['/release', payload], [payload]);
+  const queryKeyHash = hashKey(queryKey);
+
+  const { data, ...result } = useQuery<Release[], ApiError>({
+    queryKey,
+    queryFn: ({ signal }) => {
+      releaseErrorsStore.setState((state) => ({
+        errors: { ...state.errors, [queryKeyHash]: [] },
+      }));
+
+      return streamReleases(
+        getQueryPath('/release/stream') + getQueryString({ ...payload }),
+        signal,
+        // Partial results become visible while the query is still fetching
+        (releases) => queryClient.setQueryData<Release[]>(queryKey, releases),
+        (message) =>
+          releaseErrorsStore.setState((state) => ({
+            errors: {
+              ...state.errors,
+              [queryKeyHash]: [...(state.errors[queryKeyHash] ?? []), message],
+            },
+          }))
+      );
     },
-    queryOptions: {
-      // Cache and stale times set to 30 minutes
-      staleTime: THIRTY_MINUTES,
-      gcTime: THIRTY_MINUTES,
-      // Disable refetch on window focus to prevent refetching when the user switch tabs
-      refetchOnWindowFocus: false,
-      retry: false,
-    },
+    // Cache and stale times set to 30 minutes
+    staleTime: THIRTY_MINUTES,
+    gcTime: THIRTY_MINUTES,
+    // Disable refetch on window focus to prevent refetching when the user switch tabs
+    refetchOnWindowFocus: false,
+    retry: false,
   });
+
+  const indexerErrors =
+    releaseErrorsStore((state) => state.errors[queryKeyHash]) ?? [];
 
   const { data: filteredData, totalItems } = useMemo(() => {
     const { data: sortedData, totalItems } = clientSideFilterAndSort<
@@ -456,6 +485,7 @@ const useReleases = (payload: InteractiveSearchPayload, filter = '') => {
 
   return {
     ...result,
+    indexerErrors,
     data: filteredData,
     selectedFilterKey,
     sortKey,

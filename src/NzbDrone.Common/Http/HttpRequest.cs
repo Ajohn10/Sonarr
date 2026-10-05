@@ -54,6 +54,9 @@ namespace NzbDrone.Common.Http
         public string RateLimitKey { get; set; }
         public Stream ResponseStream { get; set; }
 
+        // Picks a stream for a successful response body once the response headers are known, returning null buffers the body as usual
+        public Func<HttpHeader, Stream> ResponseStreamFactory { get; set; }
+
         public override string ToString()
         {
             return ToString();

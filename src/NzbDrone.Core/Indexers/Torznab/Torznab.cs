@@ -22,6 +22,7 @@ namespace NzbDrone.Core.Indexers.Torznab
 
         public override DownloadProtocol Protocol => DownloadProtocol.Torrent;
         public override int PageSize => GetProviderPageSize();
+        public override bool SupportsNdjsonStreaming => true;
 
         public Torznab(INewznabCapabilitiesProvider capabilitiesProvider, IHttpClient httpClient, IIndexerStatusService indexerStatusService, IConfigService configService, IParsingService parsingService, Logger logger, ILocalizationService localizationService)
             : base(httpClient, indexerStatusService, configService, parsingService, logger, localizationService)
